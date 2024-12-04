@@ -12,7 +12,7 @@ class ResidualBlock(nn.Module):
             in_channels, out_channels, kernel_size=3, stride=stride, padding=1, bias=False
         )
         self.bn1 = nn.BatchNorm2d(out_channels)
-        self.activation = nn.LeakyReLU(negative_slope=0.01)
+        self.activation = nn.LeakyReLU(negative_slope=0.01, inplace=True)
         self.conv2 = nn.Conv2d(
             out_channels, out_channels, kernel_size=3, padding=1, bias=False
         )
@@ -22,8 +22,12 @@ class ResidualBlock(nn.Module):
     def forward(self, x):
         identity = x
 
-        out = self.activation(self.bn1(self.conv1(x)))
-        out = self.bn2(self.conv2(out))
+        out = self.conv1(x)
+        out = self.bn1(out)
+        out = self.activation(out)
+
+        out = self.conv2(out)
+        out = self.bn2(out)
 
         if self.downsample is not None:
             identity = self.downsample(x)
@@ -41,7 +45,7 @@ class Preprocessor(nn.Module):
             input_channels, 64, kernel_size=7, stride=2, padding=3, bias=False
         )
         self.bn1 = nn.BatchNorm2d(64)
-        self.activation = nn.LeakyReLU(negative_slope=0.01)
+        self.activation = nn.LeakyReLU(negative_slope=0.01, inplace=True)
 
         # Residual blocks
         self.layer1 = self._make_layer(ResidualBlock, 64, 128, blocks=2, stride=2)
@@ -59,17 +63,17 @@ class Preprocessor(nn.Module):
         self.decoder_layer1 = nn.Sequential(
             nn.ConvTranspose2d(512, 256, kernel_size=4, stride=2, padding=1),
             nn.BatchNorm2d(256),
-            nn.LeakyReLU(negative_slope=0.01),
+            nn.LeakyReLU(negative_slope=0.01, inplace=True),
         )
         self.decoder_layer2 = nn.Sequential(
             nn.ConvTranspose2d(256, 128, kernel_size=4, stride=2, padding=1),
             nn.BatchNorm2d(128),
-            nn.LeakyReLU(negative_slope=0.01),
+            nn.LeakyReLU(negative_slope=0.01, inplace=True),
         )
         self.decoder_layer3 = nn.Sequential(
             nn.ConvTranspose2d(128, 64, kernel_size=4, stride=2, padding=1),
             nn.BatchNorm2d(64),
-            nn.LeakyReLU(negative_slope=0.01),
+            nn.LeakyReLU(negative_slope=0.01, inplace=True),
         )
         self.decoder_layer4 = nn.Sequential(
             nn.ConvTranspose2d(
@@ -106,9 +110,11 @@ class Preprocessor(nn.Module):
 
         return nn.Sequential(*layers)
 
-    def forward(self, x):
+    def forward(self, x, reconstruct=True):
         # Encoder
-        x = self.activation(self.bn1(self.conv1(x)))  # Shape: [B, 64, H/2, W/2]
+        x = self.conv1(x)
+        x = self.bn1(x)
+        x = self.activation(x)  # Shape: [B, 64, H/2, W/2]
         x = self.layer1(x)  # Shape: [B, 128, H/4, W/4]
         x = self.layer2(x)  # Shape: [B, 256, H/8, W/8]
         x = self.layer3(x)  # Shape: [B, 512, H/16, W/16]
@@ -116,12 +122,15 @@ class Preprocessor(nn.Module):
         x = torch.flatten(x, 1)  # Shape: [B, 512]
         h = self.activation(self.fc(x))  # Bottleneck embedding
 
-        # Decoder
-        x = self.activation(self.decoder_fc(h))  # Shape: [B, 512 * 30 * 40]
-        x = x.view(-1, 512, 30, 40)  # Reshape to [B, 512, 30, 40]
-        x = self.decoder_layer1(x)  # [B, 256, 60, 80]
-        x = self.decoder_layer2(x)  # [B, 128, 120, 160]
-        x = self.decoder_layer3(x)  # [B, 64, 240, 320]
-        x_recon = self.decoder_layer4(x)  # [B, 1, 480, 640]
-
-        return h, x_recon
+        if reconstruct:
+            # Decoder
+            x = self.decoder_fc(h)  # Shape: [B, 512 * 30 * 40]
+            x = self.activation(x)
+            x = x.view(-1, 512, 30, 40)  # Reshape to [B, 512, 30, 40]
+            x = self.decoder_layer1(x)  # [B, 256, 60, 80]
+            x = self.decoder_layer2(x)  # [B, 128, 120, 160]
+            x = self.decoder_layer3(x)  # [B, 64, 240, 320]
+            x_recon = self.decoder_layer4(x)  # [B, 1, 480, 640]
+            return h, x_recon
+        else:
+            return h
