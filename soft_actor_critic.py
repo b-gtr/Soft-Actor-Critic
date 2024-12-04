@@ -12,7 +12,7 @@ def get_net(
         num_in: int,
         num_out: int,
         final_activation,
-        num_hidden_layers: int = 4,
+        num_hidden_layers: int = 6,
         num_neurons_per_hidden_layer: int = 256
     ) -> nn.Sequential:
 
@@ -20,13 +20,13 @@ def get_net(
 
     layers.extend([
         nn.Linear(num_in, num_neurons_per_hidden_layer),
-        nn.LeakyReLU(negative_slope=0.01),
+        nn.SELU(),
     ])
 
     for _ in range(num_hidden_layers):
         layers.extend([
             nn.Linear(num_neurons_per_hidden_layer, num_neurons_per_hidden_layer),
-            nn.LeakyReLU(negative_slope=0.01),
+            nn.SELU(),
         ])
 
     layers.append(nn.Linear(num_neurons_per_hidden_layer, num_out))
@@ -43,7 +43,7 @@ class NormalPolicyNet(nn.Module):
         self.shared_net = get_net(
             num_in=self.input_dim,
             num_out=256,
-            final_activation=nn.LeakyReLU(negative_slope=0.01)
+            final_activation=nn.SELU()
         )
         self.output_layer = nn.Linear(256, 2 * action_dim)  # Outputs concatenated means and log_stds
 
@@ -80,79 +80,40 @@ class ParamsPool:
             output_size=feature_dim,
             input_height=input_height,
             input_width=input_width
-        )
-
-        # Wrap the preprocessor with DataParallel if multiple GPUs are available
-        if torch.cuda.device_count() > 1:
-            print(f"Using {torch.cuda.device_count()} GPUs for Preprocessor")
-            self.preprocessor = nn.DataParallel(self.preprocessor)
-
-        self.preprocessor.to(self.device)
-        self.preprocessor_optimizer = optim.Adam(self.preprocessor.parameters(), lr=1e-4)
+        ).to(self.device)
 
         # Initialize Policy Network
         self.Normal = NormalPolicyNet(
             feature_dim=self.feature_dim,
             scalar_dim=self.scalar_dim,
             action_dim=action_dim
-        )
-
-        if torch.cuda.device_count() > 1:
-            print(f"Using {torch.cuda.device_count()} GPUs for Policy Network")
-            self.Normal = nn.DataParallel(self.Normal)
-
-        self.Normal.to(self.device)
-        self.Normal_optimizer = optim.Adam(self.Normal.parameters(), lr=1e-4)
+        ).to(self.device)
 
         # Initialize Q-Networks
         self.Q1 = QNet(
             feature_dim=self.feature_dim,
             scalar_dim=self.scalar_dim,
             action_dim=action_dim
-        )
-
-        if torch.cuda.device_count() > 1:
-            print(f"Using {torch.cuda.device_count()} GPUs for Q1 Network")
-            self.Q1 = nn.DataParallel(self.Q1)
-
-        self.Q1.to(self.device)
-        self.Q1_optimizer = optim.Adam(self.Q1.parameters(), lr=1e-4)
+        ).to(self.device)
 
         self.Q1_targ = QNet(
             feature_dim=self.feature_dim,
             scalar_dim=self.scalar_dim,
             action_dim=action_dim
-        )
-
-        if torch.cuda.device_count() > 1:
-            self.Q1_targ = nn.DataParallel(self.Q1_targ)
-
-        self.Q1_targ.to(self.device)
+        ).to(self.device)
         self.Q1_targ.load_state_dict(self.Q1.state_dict())
 
         self.Q2 = QNet(
             feature_dim=self.feature_dim,
             scalar_dim=self.scalar_dim,
             action_dim=action_dim
-        )
-
-        if torch.cuda.device_count() > 1:
-            print(f"Using {torch.cuda.device_count()} GPUs for Q2 Network")
-            self.Q2 = nn.DataParallel(self.Q2)
-
-        self.Q2.to(self.device)
-        self.Q2_optimizer = optim.Adam(self.Q2.parameters(), lr=1e-4)
+        ).to(self.device)
 
         self.Q2_targ = QNet(
             feature_dim=self.feature_dim,
             scalar_dim=self.scalar_dim,
             action_dim=action_dim
-        )
-
-        if torch.cuda.device_count() > 1:
-            self.Q2_targ = nn.DataParallel(self.Q2_targ)
-
-        self.Q2_targ.to(self.device)
+        ).to(self.device)
         self.Q2_targ.load_state_dict(self.Q2.state_dict())
 
         # Hyperparameters
@@ -165,6 +126,30 @@ class ParamsPool:
         self.log_alpha.requires_grad = True
         self.alpha_optimizer = optim.Adam([self.log_alpha], lr=1e-4)
 
+        # Optimizers
+        self.preprocessor_optimizer = optim.Adam(self.preprocessor.parameters(), lr=1e-4)
+        self.Normal_optimizer = optim.Adam(self.Normal.parameters(), lr=1e-4)
+        self.Q1_optimizer = optim.Adam(self.Q1.parameters(), lr=1e-4)
+        self.Q2_optimizer = optim.Adam(self.Q2.parameters(), lr=1e-4)
+
+        # DataParallel wrapping (only when necessary)
+        self.wrap_models_with_dataparallel()
+
+    def wrap_models_with_dataparallel(self):
+        if torch.cuda.device_count() > 1:
+            print(f"Using {torch.cuda.device_count()} GPUs for training.")
+
+            # Wrap models with DataParallel for multi-GPU training
+            self.Normal = nn.DataParallel(self.Normal)
+            self.Q1 = nn.DataParallel(self.Q1)
+            self.Q2 = nn.DataParallel(self.Q2)
+            self.preprocessor = nn.DataParallel(self.preprocessor)
+
+            self.Normal.to(self.device)
+            self.Q1.to(self.device)
+            self.Q2.to(self.device)
+            self.preprocessor.to(self.device)
+
     @property
     def alpha(self):
         return self.log_alpha.exp()
@@ -175,7 +160,6 @@ class ParamsPool:
     def sample_action_and_compute_log_pi(self, features: torch.tensor, scalars: torch.tensor, use_reparametrization_trick: bool) -> tuple:
         outputs = self.Normal(features, scalars)
         if isinstance(outputs, (tuple, list)):
-            # If outputs are lists (from DataParallel), concatenate them
             outputs = torch.cat(outputs, dim=0)
         # Split the outputs into means and log_stds
         means, log_stds = torch.chunk(outputs, 2, dim=-1)
@@ -210,6 +194,10 @@ class ParamsPool:
 
     # Methods for learning
     def update_networks(self, b: Batch) -> None:
+        # Wrap models with DataParallel if not already wrapped
+        if not isinstance(self.preprocessor, nn.DataParallel) and torch.cuda.device_count() > 1:
+            self.wrap_models_with_dataparallel()
+
         # Get features for current state
         features_s, x_recon_s = self.preprocessor(b.img)
 
@@ -218,7 +206,7 @@ class ParamsPool:
 
         # Step 12: calculating targets
         with torch.no_grad():
-            features_ns, x_recon_ns = self.preprocessor(b.n_img)
+            features_ns = self.preprocessor(b.n_img, reconstruct=False)
             # Calculate next action using next state
             na, log_pi_na_given_ns = self.sample_action_and_compute_log_pi(
                 features_ns, b.n_scalars, use_reparametrization_trick=False)
@@ -281,11 +269,15 @@ class ParamsPool:
         image_tensor = torch.tensor(image).unsqueeze(0).unsqueeze(0).float().to(self.device)  # Shape: (1, 1, H, W)
         scalars_tensor = torch.tensor(scalars).unsqueeze(0).float().to(self.device)  # Shape: (1, scalar_dim)
 
+        # Use original models (not DataParallel) during inference
+        preprocessor = self.preprocessor.module if isinstance(self.preprocessor, nn.DataParallel) else self.preprocessor
+        normal_policy_net = self.Normal.module if isinstance(self.Normal, nn.DataParallel) else self.Normal
+
         # Get features from preprocessor
         with torch.no_grad():
-            features, _ = self.preprocessor(image_tensor)
+            features = preprocessor(image_tensor, reconstruct=False)
 
-        outputs = self.Normal(features, scalars_tensor)
+        outputs = normal_policy_net(features, scalars_tensor)
         if isinstance(outputs, (tuple, list)):
             outputs = torch.cat(outputs, dim=0)
         means, log_stds = torch.chunk(outputs, 2, dim=-1)
@@ -308,13 +300,21 @@ class ParamsPool:
 
     # Save model parameters
     def save_model(self, save_path: str) -> None:
+        # Save the state_dict of the original models
+        preprocessor = self.preprocessor.module if isinstance(self.preprocessor, nn.DataParallel) else self.preprocessor
+        normal_policy_net = self.Normal.module if isinstance(self.Normal, nn.DataParallel) else self.Normal
+        Q1 = self.Q1.module if isinstance(self.Q1, nn.DataParallel) else self.Q1
+        Q2 = self.Q2.module if isinstance(self.Q2, nn.DataParallel) else self.Q2
+        Q1_targ = self.Q1_targ.module if isinstance(self.Q1_targ, nn.DataParallel) else self.Q1_targ
+        Q2_targ = self.Q2_targ.module if isinstance(self.Q2_targ, nn.DataParallel) else self.Q2_targ
+
         torch.save({
-            'preprocessor_state_dict': self.preprocessor.state_dict(),
-            'Normal_state_dict': self.Normal.state_dict(),
-            'Q1_state_dict': self.Q1.state_dict(),
-            'Q2_state_dict': self.Q2.state_dict(),
-            'Q1_targ_state_dict': self.Q1_targ.state_dict(),
-            'Q2_targ_state_dict': self.Q2_targ.state_dict(),
+            'preprocessor_state_dict': preprocessor.state_dict(),
+            'Normal_state_dict': normal_policy_net.state_dict(),
+            'Q1_state_dict': Q1.state_dict(),
+            'Q2_state_dict': Q2.state_dict(),
+            'Q1_targ_state_dict': Q1_targ.state_dict(),
+            'Q2_targ_state_dict': Q2_targ.state_dict(),
             'preprocessor_optimizer_state_dict': self.preprocessor_optimizer.state_dict(),
             'Normal_optimizer_state_dict': self.Normal_optimizer.state_dict(),
             'Q1_optimizer_state_dict': self.Q1_optimizer.state_dict(),
@@ -325,12 +325,20 @@ class ParamsPool:
 
     def load_model(self, load_path: str) -> None:
         checkpoint = torch.load(load_path, map_location=self.device)
-        self.preprocessor.load_state_dict(checkpoint['preprocessor_state_dict'])
-        self.Normal.load_state_dict(checkpoint['Normal_state_dict'])
-        self.Q1.load_state_dict(checkpoint['Q1_state_dict'])
-        self.Q2.load_state_dict(checkpoint['Q2_state_dict'])
-        self.Q1_targ.load_state_dict(checkpoint['Q1_targ_state_dict'])
-        self.Q2_targ.load_state_dict(checkpoint['Q2_targ_state_dict'])
+
+        preprocessor = self.preprocessor.module if isinstance(self.preprocessor, nn.DataParallel) else self.preprocessor
+        normal_policy_net = self.Normal.module if isinstance(self.Normal, nn.DataParallel) else self.Normal
+        Q1 = self.Q1.module if isinstance(self.Q1, nn.DataParallel) else self.Q1
+        Q2 = self.Q2.module if isinstance(self.Q2, nn.DataParallel) else self.Q2
+        Q1_targ = self.Q1_targ.module if isinstance(self.Q1_targ, nn.DataParallel) else self.Q1_targ
+        Q2_targ = self.Q2_targ.module if isinstance(self.Q2_targ, nn.DataParallel) else self.Q2_targ
+
+        preprocessor.load_state_dict(checkpoint['preprocessor_state_dict'])
+        normal_policy_net.load_state_dict(checkpoint['Normal_state_dict'])
+        Q1.load_state_dict(checkpoint['Q1_state_dict'])
+        Q2.load_state_dict(checkpoint['Q2_state_dict'])
+        Q1_targ.load_state_dict(checkpoint['Q1_targ_state_dict'])
+        Q2_targ.load_state_dict(checkpoint['Q2_targ_state_dict'])
         self.preprocessor_optimizer.load_state_dict(checkpoint['preprocessor_optimizer_state_dict'])
         self.Normal_optimizer.load_state_dict(checkpoint['Normal_optimizer_state_dict'])
         self.Q1_optimizer.load_state_dict(checkpoint['Q1_optimizer_state_dict'])
